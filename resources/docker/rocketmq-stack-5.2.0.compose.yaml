@@ -1,26 +1,53 @@
+# RocketMQ容器化部署方案，包含 NameServer（注册中心）+ Broker（消息存储 / 代理）+ Dashboard（可视化控制台） 三大核心组件，用 Docker Compose 统一编排管理。
+
+# 编排名字
 name: rocketmq-stack
 
+# 定义所有要启动的容器服务
 services:
+  # rmqnamesrv是服务名称。
+  # RocketMQ 的服务注册中心，所有生产者、消费者、Broker 都要向它注册，它负责维护服务地址列表。
   rmqnamesrv:
+    # 使用官方 5.2.0 镜像
     image: apache/rocketmq:5.2.0
+    # 容器名
     container_name: rmqnamesrv
+    # 端口映射：主机:容器
     ports:
       - "9876:9876"
     environment:
+      # JVM 内存配置（初始256m，最大400m）
       JAVA_OPT_EXT: "-Xms256m -Xmx400m"
+    # 容器启动命令：启动 NameServer
     command: sh mqnamesrv
+    # 把这个容器，加入名叫 rocketmq 的自定义网络。让容器之间能用 “容器名” 当域名访问。
+    # 每次重启容器 IP 可能会变，用IP访问会比较混乱。
+    # broker 要连 namesrv，直接写 rmqnamesrv:9876。
+    # dashboard 连 namesrv，直接写 rmqnamesrv:9876。
     networks:
       - rocketmq
+    # 自动重启（除非手动停止）
     restart: unless-stopped
+    # 健康检查
     healthcheck:
       test: [ "CMD-SHELL", "grep -q 'The Name Server boot success' /home/rocketmq/logs/rocketmqlogs/namesrv.log || exit 1" ]
       interval: 10s
       timeout: 5s
       retries: 10
 
+  # rmqbroker是服务名称。
+  # RocketMQ 真正处理消息的核心组件
   rmqbroker:
+    # 使用官方 5.2.0 镜像，和 NameServer 用同一个镜像，只是启动命令不一样，一个当注册中心，一个当消息核心。
     image: apache/rocketmq:5.2.0
+    # 容器名字
     container_name: rmqbroker
+    # 端口映射：主机端口：容器内端口。
+    # 10911：Broker 对外服务端口（生产者 / 消费者连这个）
+    # 10912：主从同步端口（集群用）
+    # 10909：VIP 通道（高版本 RocketMQ 默认开启）
+    # 8080、8081：RocketMQ 5.x Proxy 端口
+    # 8082：给 Dashboard 控制台用（共享网络）
     ports:
       - "10912:10912"
       - "10911:10911"
@@ -29,11 +56,24 @@ services:
       - "8081:8081"
       - "8082:8082"                              # ← dashboard 端口也从这里暴露
     environment:
+      # 告诉 Broker：注册中心在哪里
+      # Docker 会自动解析成正确 IP
       NAMESRV_ADDR: "rmqnamesrv:9876"
+      # JVM 内存配置
       JAVA_OPT_EXT: "-Xms512m -Xmx512m"
+    # 必须等 NameServer 完全启动成功、健康检查通过，Broker 才会启动。
     depends_on:
       rmqnamesrv:
         condition: service_healthy
+    # 启动 Broker 前，自动在容器内创建 broker.conf 配置文件。
+    # brokerClusterName = DefaultCluster：集群名字，随便写，单机无所谓。
+    # brokerName = broker-a：Broker 名字，唯一标识。
+    # brokerId = 0：0 = 主节点，非 0 = 从节点。
+    # deleteWhen = 04：每天凌晨 4 点删除过期消息。
+    # brokerRole = ASYNC_MASTER：异步主节点（高性能，生产最常用）。
+    # flushDiskType = ASYNC_FLUSH：异步刷盘（性能极高）。
+    # brokerIP1 = 127.0.0.1：Broker 对外暴露的 IP。
+    # timerMaxDelaySec = 31622400：最大延时消息时间（1 年）。
     command:
       - sh
       - -c
@@ -51,13 +91,22 @@ services:
         EOF
         sh mqbroker --enable-proxy \
           -c /home/rocketmq/rocketmq-5.2.0/conf/broker.conf
+    # 加入名为 rocketmq 的 Docker 网络，这样才能用 rmqnamesrv 域名访问注册中心。
     networks:
       - rocketmq
+    # 自动重启（除非手动停止）
     restart: unless-stopped
 
+  # 服务名。
   dashboard:
     image: apacherocketmq/rocketmq-dashboard:2.1.0
     container_name: rocketmq-dashboard
+    # dashboard 不自带网络和端口，直接 “寄生” 在 rmqbroker 身上，共用它的 IP、端口、网络。
+    # 访问 broker 的 8082 端口 = 访问 dashboard。
+    # 不用给 dashboard 单独开端口。
+    # 共享网络：dashboard 和 broker 同一个 IP
+    # 共享端口：dashboard 用 broker 暴露的端口
+    # 简化部署：不用给 dashboard 写 ports 配置
     network_mode: "service:rmqbroker"            # ← 关键：共享 broker 网络栈
     environment:
       JAVA_OPTS: >-
@@ -71,6 +120,12 @@ services:
         condition: service_started
     restart: unless-stopped
 
+# 创建一个名叫 rocketmq 的 Docker 网桥（局域网），让容器在里面互相通信。
 networks:
+  # 给这个网络起个名字，叫 rocketmq。
   rocketmq:
+    # Docker 默认的网络模式：网桥（bridge）
+    # 给所有加入这个网络的容器，创建一个独立的虚拟局域网。
+    # 容器之间可以互相访问。
+    # 容器可以用名字当域名访问。
     driver: bridge
